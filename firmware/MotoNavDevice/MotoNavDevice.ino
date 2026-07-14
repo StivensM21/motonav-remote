@@ -315,19 +315,19 @@ void drawChevron2(int cx, int ty, float s) {
 
 // дорога впереди в стиле Beeline: объёмная полоса (ореол+кромка+сердцевина) с разметкой
 void drawRoad() {
-  const float ax = 116, ay = 182;                    // якорь у нижнего шеврона
+  const float ax = 120, ay = 182;                    // якорь у нижнего шеврона (по центру)
   float xs[17], ys[17];
   int n = 0;
   xs[n] = ax; ys[n] = ay; n++;
   for (uint8_t i = 0; i < navN && n < 17; i++) {
     xs[n] = ax + navPX[i]; ys[n] = ay - navPY[i]; n++;
   }
-  if (n < 2) { drawChevron2(116, 196, 1.0f); return; }
+  if (n < 2) { drawChevron2(120, 196, 1.0f); return; }
   stampPath(xs, ys, n, 12, 7,    C_AMB3);            // ореол/глубина
   stampPath(xs, ys, n, 9,  5,    C_AMB2);            // кромка
   stampPath(xs, ys, n, 7,  3.2f, C_AMBER);          // сердцевина
   stampDashes(xs, ys, n);                            // разметка
-  drawChevron2(116, 196, 1.0f);                      // двойной шеврон
+  drawChevron2(120, 196, 1.0f);                      // двойной шеврон
 }
 
 // ---- крупные сегментные цифры (гладкие, из штампованных штрихов) ----
@@ -355,12 +355,18 @@ void drawDigit(char ch, float x, float y, float w, float h, uint16_t c) {
   if (m & 64) segLine(x + r, m2, x + w - r, m2, r, c);          // середина
 }
 
-void drawNumber(const char *s, int cx, int y, float w, float h, uint16_t c) {
+float numberWidth(const char *s, float w) {
   const float gap = w * 0.45f, dw = w * 0.4f;
   int n = strlen(s);
   float total = 0;
   for (int i = 0; i < n; i++) total += (s[i] == '.' ? dw : w) + (i < n - 1 ? gap : 0);
-  float x = cx - total / 2;
+  return total;
+}
+
+void drawNumber(const char *s, int cx, int y, float w, float h, uint16_t c) {
+  const float gap = w * 0.45f, dw = w * 0.4f;
+  int n = strlen(s);
+  float x = cx - numberWidth(s, w) / 2;
   for (int i = 0; i < n; i++) {
     if (s[i] == '.') { gfx->fillCircle((int16_t)(x + dw / 2), (int16_t)(y + h), (int16_t)(w * 0.16f), c); x += dw + gap; }
     else             { drawDigit(s[i], x, y, w, h, c);                                                    x += w + gap; }
@@ -370,13 +376,13 @@ void drawNumber(const char *s, int cx, int y, float w, float h, uint16_t c) {
 // дуга прогресса маршрута по нижнему краю + засечки контрольных точек
 void drawProgressArc() {
   if (navProg > 100) return;
-  gfx->fillArc(120, 120, 118, 114, 45, 135, C_AMB3);
+  gfx->fillArc(120, 120, 118, 113, 45, 135, C_AMB2);   // дорожка ярче, чем фон
   if (navProg > 0)
-    gfx->fillArc(120, 120, 118, 114, 135 - 0.9f * navProg, 135, C_AMBER);
+    gfx->fillArc(120, 120, 118, 113, 135 - 0.9f * navProg, 135, C_AMBER);
   for (int i = 0; i <= 4; i++) {
     float d = (45 + 22.5f * i) * (float)M_PI / 180.0f;
-    uint16_t c = ((float)i / 4 <= navProg / 100.0f) ? C_AMBER : C_AMB3;
-    gfx->fillCircle((int16_t)(120 + cosf(d) * 116), (int16_t)(120 + sinf(d) * 116), 2, c);
+    uint16_t c = ((float)i / 4 <= navProg / 100.0f) ? C_AMBER : C_AMB2;
+    gfx->fillCircle((int16_t)(120 + cosf(d) * 115), (int16_t)(120 + sinf(d) * 115), 3, c);
   }
 }
 
@@ -488,13 +494,16 @@ void drawScreen() {
   if (navN) drawRoad();
   else      drawArrow(navType, 120, 120);
 
-  // маска под цифрами и крупная дистанция сверху
-  gfx->fillRect(0, 0, 240, 64, C_BG);
+  // маска под цифрами и крупная дистанция сверху, число+единицы по центру
+  gfx->fillRect(0, 0, 240, 66, C_BG);
   char d[8]; const char *u;
   if (navDist >= 1000) { snprintf(d, sizeof(d), "%u.%u", (unsigned)(navDist / 1000), (unsigned)((navDist % 1000) / 100)); u = "km"; }
   else                 { snprintf(d, sizeof(d), "%u", (unsigned)navDist); u = "m"; }
-  drawNumber(d, 110, 20, 22, 36, C_AMBER);
-  textAt(170, 50, u, 1, C_AMB2);
+  const float dW = 22, uSize = 2, uGap = 10;
+  float nw = numberWidth(d, dW), uw = strlen(u) * 6 * uSize;
+  float startX = 120 - (nw + uGap + uw) / 2;
+  drawNumber(d, (int)(startX + nw / 2), 20, dW, 36, C_AMBER);
+  textAt((int)(startX + nw + uGap + uw / 2), 42, u, uSize, C_AMB2);
 
   drawBattRight();
   drawProgressArc();
