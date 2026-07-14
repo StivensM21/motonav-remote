@@ -48,7 +48,8 @@
 #define C_INK   0xFFFF
 #define C_DIM   0x8C93
 #define C_AMBER 0xFB60   // ~RGB(255,108,0)
-#define C_AMB2  0x79A0   // тот же тон, приглушённый — для подписей
+#define C_AMB2  0x8A40   // тот же тон, приглушённый — кромка дороги, подписи
+#define C_AMB3  0x38C0   // тёмно-янтарный — ореол/глубина, разметка
 #define C_MINT  0x6E98
 #define C_RED   0xE2C9
 
@@ -282,21 +283,51 @@ void stampPath(const float *xs, const float *ys, int n, float r0, float r1, uint
   }
 }
 
-// дорога впереди в стиле Beeline: гладкая полоса от шеврона вверх по форме маршрута
+// разметка-пунктир по центру дороги (тёмные штрихи поверх сердцевины)
+void stampDashes(const float *xs, const float *ys, int n) {
+  int idx = 0;
+  for (int i = 0; i < n - 1; i++) {
+    int i0 = i > 0 ? i - 1 : 0, i3 = i + 2 < n ? i + 2 : n - 1;
+    float p0x = xs[i0], p0y = ys[i0], p1x = xs[i], p1y = ys[i];
+    float p2x = xs[i + 1], p2y = ys[i + 1], p3x = xs[i3], p3y = ys[i3];
+    int st = (int)(hypotf(p2x - p1x, p2y - p1y) / 1.5f);
+    if (st < 2) st = 2;
+    for (int k = 0; k <= st; k++, idx++) {
+      float t = (float)k / st, t2 = t * t, t3 = t2 * t;
+      float x = 0.5f * (2*p1x + (-p0x + p2x)*t + (2*p0x - 5*p1x + 4*p2x - p3x)*t2 + (-p0x + 3*p1x - 3*p2x + p3x)*t3);
+      float y = 0.5f * (2*p1y + (-p0y + p2y)*t + (2*p0y - 5*p1y + 4*p2y - p3y)*t2 + (-p0y + 3*p1y - 3*p2y + p3y)*t3);
+      float u = ((float)i + t) / (float)(n - 1);
+      if ((idx % 9) < 4)
+        gfx->fillCircle((int16_t)x, (int16_t)y, (int16_t)(1.6f * (1 - u * 0.4f)) + 1, C_AMB3);
+    }
+  }
+}
+
+// двойной шеврон-указатель «моё положение»
+void drawChevron2(int cx, int ty, float s) {
+  for (int i = 0; i < 2; i++) {
+    uint16_t c = i ? C_AMB2 : C_AMBER;
+    float o = i * 15 * s;
+    segLine(cx - 15 * s, ty + 18 * s + o, cx,          ty + 2 * s + o, 3.5f * s, c);
+    segLine(cx,          ty + 2 * s + o, cx + 15 * s,  ty + 18 * s + o, 3.5f * s, c);
+  }
+}
+
+// дорога впереди в стиле Beeline: объёмная полоса (ореол+кромка+сердцевина) с разметкой
 void drawRoad() {
-  const float ax = 120, ay = 150;
+  const float ax = 116, ay = 182;                    // якорь у нижнего шеврона
   float xs[17], ys[17];
   int n = 0;
-  xs[n] = ax; ys[n] = ay; n++;                       // старт — у шеврона
+  xs[n] = ax; ys[n] = ay; n++;
   for (uint8_t i = 0; i < navN && n < 17; i++) {
     xs[n] = ax + navPX[i]; ys[n] = ay - navPY[i]; n++;
   }
-  if (n < 2) return;
-  stampPath(xs, ys, n, 10, 6, C_AMB2);               // тёмная кромка
-  stampPath(xs, ys, n, 8, 4, C_AMBER);               // сердцевина
-  // зазор и шеврон-указатель, как на Beeline
-  gfx->fillTriangle(98, 186, 142, 186, 120, 138, C_BG);
-  gfx->fillTriangle(104, 180, 136, 180, 120, 146, C_AMBER);
+  if (n < 2) { drawChevron2(116, 196, 1.0f); return; }
+  stampPath(xs, ys, n, 12, 7,    C_AMB3);            // ореол/глубина
+  stampPath(xs, ys, n, 9,  5,    C_AMB2);            // кромка
+  stampPath(xs, ys, n, 7,  3.2f, C_AMBER);          // сердцевина
+  stampDashes(xs, ys, n);                            // разметка
+  drawChevron2(116, 196, 1.0f);                      // двойной шеврон
 }
 
 // ---- крупные сегментные цифры (гладкие, из штампованных штрихов) ----
@@ -313,7 +344,8 @@ void drawDigit(char ch, float x, float y, float w, float h, uint16_t c) {
   static const uint8_t M[10] = {0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F};
   if (ch < '0' || ch > '9') return;
   uint8_t m = M[ch - '0'];
-  float r = 3.0f, m2 = y + h / 2;
+  float r = w * 0.14f, m2 = y + h / 2;
+  if (r < 2.5f) r = 2.5f;
   if (m & 1)  segLine(x + r, y, x + w - r, y, r, c);            // верх
   if (m & 2)  segLine(x + w, y + r, x + w, m2 - r, r, c);       // правый верх
   if (m & 4)  segLine(x + w, m2 + r, x + w, y + h - r, r, c);   // правый низ
@@ -323,24 +355,86 @@ void drawDigit(char ch, float x, float y, float w, float h, uint16_t c) {
   if (m & 64) segLine(x + r, m2, x + w - r, m2, r, c);          // середина
 }
 
-void drawNumber(const char *s, int cx, int y, float h, uint16_t c) {
-  const float w = 20, gap = 9;
+void drawNumber(const char *s, int cx, int y, float w, float h, uint16_t c) {
+  const float gap = w * 0.45f, dw = w * 0.4f;
   int n = strlen(s);
   float total = 0;
-  for (int i = 0; i < n; i++) total += (s[i] == '.' ? 8 : w) + (i < n - 1 ? gap : 0);
+  for (int i = 0; i < n; i++) total += (s[i] == '.' ? dw : w) + (i < n - 1 ? gap : 0);
   float x = cx - total / 2;
   for (int i = 0; i < n; i++) {
-    if (s[i] == '.') { gfx->fillCircle((int16_t)(x + 4), (int16_t)(y + h), 4, c); x += 8 + gap; }
-    else             { drawDigit(s[i], x, y, w, h, c);                            x += w + gap; }
+    if (s[i] == '.') { gfx->fillCircle((int16_t)(x + dw / 2), (int16_t)(y + h), (int16_t)(w * 0.16f), c); x += dw + gap; }
+    else             { drawDigit(s[i], x, y, w, h, c);                                                    x += w + gap; }
   }
 }
 
-// дуга прогресса маршрута по нижнему краю, слева направо
+// дуга прогресса маршрута по нижнему краю + засечки контрольных точек
 void drawProgressArc() {
   if (navProg > 100) return;
-  gfx->fillArc(120, 120, 118, 114, 45, 135, C_AMB2);
+  gfx->fillArc(120, 120, 118, 114, 45, 135, C_AMB3);
   if (navProg > 0)
     gfx->fillArc(120, 120, 118, 114, 135 - 0.9f * navProg, 135, C_AMBER);
+  for (int i = 0; i <= 4; i++) {
+    float d = (45 + 22.5f * i) * (float)M_PI / 180.0f;
+    uint16_t c = ((float)i / 4 <= navProg / 100.0f) ? C_AMBER : C_AMB3;
+    gfx->fillCircle((int16_t)(120 + cosf(d) * 116), (int16_t)(120 + sinf(d) * 116), 2, c);
+  }
+}
+
+// ---- заставка: батарея справа, локатор с радар-волнами, буквы GPS ----
+void drawBattRight() {
+  int x = 214, y = 120, w = 13, h = 26;
+  uint16_t c = battCache <= 20 ? C_RED : C_MINT;
+  gfx->drawRect(x - w / 2, y - h / 2, w, h, C_DIM);
+  gfx->fillRect(x - 3, y - h / 2 - 3, 6, 3, C_DIM);
+  int fh = (h - 4) * battCache / 100;
+  if (fh > 0) gfx->fillRect(x - w / 2 + 2, y + h / 2 - 2 - fh, w - 4, fh, c);
+  char t[6]; snprintf(t, sizeof(t), "%d%%", battCache);
+  gfx->setTextSize(1); gfx->setTextColor(C_DIM);
+  gfx->setCursor(x - (int)strlen(t) * 3, y + h / 2 + 6); gfx->print(t);
+}
+
+void drawLocator(int cx, int cy, float s, uint16_t c) {
+  gfx->fillTriangle(cx, cy - s, cx + s * 0.72f, cy + s * 0.8f, cx, cy + s * 0.4f, c);
+  gfx->fillTriangle(cx, cy - s, cx, cy + s * 0.4f, cx - s * 0.72f, cy + s * 0.8f, c);
+}
+
+void drawWave(int cx, int cy, int r, uint16_t c) {
+  for (float a = -0.15f * (float)M_PI; a <= 1.15f * (float)M_PI; a += 0.05f)
+    gfx->fillCircle((int16_t)(cx + cosf(a) * r), (int16_t)(cy + sinf(a) * r), 1, c);
+}
+
+// буквы GPS — ломаные по долям рамки, штрихи с круглыми концами (гладко)
+void glyphStroke(const float *fx, const float *fy, int n, float ox, float oy,
+                 float w, float h, float r, uint16_t c) {
+  for (int i = 0; i < n - 1; i++)
+    segLine(ox + fx[i] * w, oy + fy[i] * h, ox + fx[i + 1] * w, oy + fy[i + 1] * h, r, c);
+}
+void drawGPS(int cx, int topY, float w, float h, float gap, uint16_t c) {
+  static const float GX[] = {1.0,0.72,0.28,0.0,0.0,0.28,0.72,1.0,1.0,0.55};
+  static const float GY[] = {0.16,0.0,0.0,0.25,0.75,1.0,1.0,0.75,0.52,0.52};
+  static const float PX[] = {0.0,0.0,0.68,1.0,0.68,0.0};
+  static const float PY[] = {1.0,0.0,0.0,0.22,0.46,0.46};
+  static const float SX[] = {1.0,0.7,0.3,0.0,0.3,0.7,1.0,0.7,0.3,0.0};
+  static const float SY[] = {0.16,0.0,0.0,0.24,0.48,0.56,0.8,1.0,1.0,0.84};
+  float total = 3 * w + 2 * gap, x = cx - total / 2, r = w * 0.16f;
+  if (r < 2) r = 2;
+  for (int pass = 0; pass < 2; pass++) {                // тёмный ореол, потом яркая заливка
+    uint16_t col = pass ? c : C_AMB3;
+    float rr = pass ? r : r + 2;
+    glyphStroke(GX, GY, 10, x,                 topY, w, h, rr, col);
+    glyphStroke(PX, PY, 6,  x + w + gap,        topY, w, h, rr, col);
+    glyphStroke(SX, SY, 10, x + 2 * (w + gap),  topY, w, h, rr, col);
+  }
+}
+
+void drawSplash(const char *sub, uint16_t subCol) {
+  drawWave(112, 96, 22, C_AMBER);
+  drawWave(112, 96, 44, C_AMB2);
+  drawWave(112, 96, 66, C_AMB3);
+  drawLocator(112, 96, 20, C_AMBER);
+  drawGPS(112, 170, 18, 24, 9, C_AMBER);
+  textAt(120, 206, sub, 1, subCol);
+  drawBattRight();
 }
 
 // стрелка манёвра, центр в (cx, cy)
@@ -386,36 +480,23 @@ void drawArrow(uint8_t type, int cx, int cy) {
 void drawScreen() {
   gfx->fillScreen(C_BG);
 
-  if (!connected) {
-    textCentered("GPS", 78, 5, C_AMBER);
-    textCentered("Ready for the trip", 132, 2, C_DIM);
-    drawBatteryBar(92, 208, true);
-    return;
-  }
-  if (navAt == 0) {
-    textCentered("GPS", 68, 5, C_AMBER);
-    textCentered("connected", 122, 2, C_MINT);
-    textCentered("no route yet", 147, 2, C_DIM);
-    drawBatteryBar(92, 208, true);
-    return;
-  }
+  // заставка (вариант 2): локатор с радар-волнами + GPS
+  if (!connected) { drawSplash("Ready for the trip", C_DIM); return; }
+  if (navAt == 0) { drawSplash("connected", C_MINT);          return; }
 
-  // дорога — фоном, статус и цифры поверх неё
+  // экран навигации (вариант Л): дорога снизу, крупные метры сверху
   if (navN) drawRoad();
-  else      drawArrow(navType, 120, 84);
+  else      drawArrow(navType, 120, 120);
 
-  drawBatteryBar(104, 8, false);
-  char sp[12]; snprintf(sp, sizeof(sp), "%u km/h", (unsigned)navSpd);
-  textAt(120, 26, sp, 1, C_DIM);
-
-  // низ: иконка манёвра и дистанция сегментными цифрами, как на Beeline
-  drawMini(navType, 62, 198);
+  // маска под цифрами и крупная дистанция сверху
+  gfx->fillRect(0, 0, 240, 64, C_BG);
   char d[8]; const char *u;
   if (navDist >= 1000) { snprintf(d, sizeof(d), "%u.%u", (unsigned)(navDist / 1000), (unsigned)((navDist % 1000) / 100)); u = "km"; }
   else                 { snprintf(d, sizeof(d), "%u", (unsigned)navDist); u = "m"; }
-  drawNumber(d, 134, 184, 32, C_AMBER);
-  textAt(134, 224, u, 1, C_AMB2);
+  drawNumber(d, 110, 20, 22, 36, C_AMBER);
+  textAt(170, 50, u, 1, C_AMB2);
 
+  drawBattRight();
   drawProgressArc();
 }
 
