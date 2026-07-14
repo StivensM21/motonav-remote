@@ -92,6 +92,7 @@ const CHR_STATE = "6e6f7602-b5a3-f393-e0a9-e50e24dcca9e"; // статус (read/
 const CHR_CFG   = "6e6f7603-b5a3-f393-e0a9-e50e24dcca9e"; // настройки (read/write): [ver][сон, мин (0=никогда)][яркость %]
 
 let chr = null, cfgChr = null, steps = [], watchId = null, wakeLock = null;
+let routeGeom = [], gIdx = 0, lastPos = null; // геометрия маршрута для отрисовки дороги на устройстве
 const $ = id => document.getElementById(id);
 const log = m => { $('log').textContent = m + "\n" + $('log').textContent; };
 
@@ -225,7 +226,7 @@ $('go').onclick = async () => {
   const from = `${me.coords.longitude},${me.coords.latitude}`;
   const to = `${lon},${lat}`;
   const url = `https://router.project-osrm.org/route/v1/driving/${from};${to}` +
-              `?overview=false&steps=true&annotations=false`;
+              `?overview=full&geometries=geojson&steps=true&annotations=false`;
 
   log("Считаю маршрут…");
   const r = await fetch(url).then(x => x.json());
@@ -238,6 +239,8 @@ $('go').onclick = async () => {
     type: mapType(s.maneuver),
     done: false
   }));
+  routeGeom = r.routes[0].geometry.coordinates.map(c => ({ lat: c[1], lon: c[0] }));
+  gIdx = 0; lastPos = null;
   log(`Маршрут готов: ${steps.length} манёвров, ${(r.routes[0].distance/1000).toFixed(1)} км.`);
   startRide();
 };
@@ -267,13 +270,21 @@ function haversine(a, b, c, d) {
   return 2 * R * Math.asin(Math.sqrt(s));
 }
 
+function bearingTo(la1, lo1, la2, lo2) {
+  const r = Math.PI / 180;
+  const y = Math.sin((lo2 - lo1) * r) * Math.cos(la2 * r);
+  const x = Math.cos(la1 * r) * Math.sin(la2 * r) -
+            Math.sin(la1 * r) * Math.cos(la2 * r) * Math.cos((lo2 - lo1) * r);
+  return Math.atan2(y, x) / r;
+}
+
 let lastSend = 0;
 function onFix(pos) {
   if (!chr || !steps.length) return;
   if (Date.now() - lastSend < 1000) return;          // не чаще 1 Гц — бережём батарею
   lastSend = Date.now();
 
-  const { latitude: la, longitude: lo, speed } = pos.coords;
+  const { latitude: la, longitude: lo, speed, heading } = pos.coords;
 
   // ближайший невыполненный манёвр
   const next = steps.find(s => !s.done);
@@ -282,17 +293,47 @@ function onFix(pos) {
   if (d < 25) { next.done = true; }                  // поворот пройден
 
   const kmh = Math.round((speed || 0) * 3.6);
-  const remaining = steps.filter(s => !s.done).length;
-  const eta = Math.round(d / 1000 / Math.max(20, kmh) * 60);
 
-  const buf = new DataView(new ArrayBuffer(10));
-  buf.setUint8(0, 1);                                // версия протокола
-  buf.setUint8(1, next.type);
-  buf.setUint16(2, Math.min(65535, Math.round(d)), true);
-  buf.setUint8(4, Math.min(255, kmh));
-  buf.setUint8(5, 0);                                // флаги: сход/перестроение сюда
-  buf.setUint16(6, Math.min(65535, Math.round(d / 10)), true);
-  buf.setUint16(8, Math.min(65535, eta), true);
+  // курс: из GPS; стоим на месте — по последним точкам; иначе на ближайший манёвр
+  let hdg = (heading !== null && !isNaN(heading) && kmh > 3) ? heading : null;
+  if (hdg === null && lastPos) {
+    const dE = (lo - lastPos.lon) * Math.cos(la * Math.PI / 180) * 111320;
+    const dN = (la - lastPos.lat) * 110540;
+    if (Math.hypot(dE, dN) > 3) hdg = Math.atan2(dE, dN) * 180 / Math.PI;
+  }
+  if (hdg === null) hdg = bearingTo(la, lo, next.lat, next.lon);
+  lastPos = { lat: la, lon: lo };
+
+  // двигаем указатель по геометрии маршрута к ближайшей точке
+  while (gIdx < routeGeom.length - 1 &&
+         haversine(la, lo, routeGeom[gIdx + 1].lat, routeGeom[gIdx + 1].lon) <=
+         haversine(la, lo, routeGeom[gIdx].lat, routeGeom[gIdx].lon)) gIdx++;
+
+  // дорога впереди (~450 м) → пиксели экрана устройства, курс всегда «вверх»
+  const hr = hdg * Math.PI / 180, S = 0.45, pts = [];
+  let acc = 0, prev = { lat: la, lon: lo };
+  for (let i = gIdx + 1; i < routeGeom.length && pts.length < 15 && acc < 450; i++) {
+    const p = routeGeom[i];
+    const seg = haversine(prev.lat, prev.lon, p.lat, p.lon);
+    if (seg < 12 && i < routeGeom.length - 1) continue;   // прореживаем плотные точки
+    acc += seg; prev = p;
+    const e = (p.lon - lo) * Math.cos(la * Math.PI / 180) * 111320;
+    const n = (p.lat - la) * 110540;
+    const x = e * Math.cos(hr) - n * Math.sin(hr);
+    const y = e * Math.sin(hr) + n * Math.cos(hr);
+    pts.push([Math.max(-127, Math.min(127, Math.round(x * S))),
+              Math.max(-127, Math.min(127, Math.round(y * S)))]);
+  }
+
+  // пакет v2: заголовок + форма дороги (см. PROTOCOL.md)
+  const buf = new Uint8Array(6 + pts.length * 2);
+  const dv = new DataView(buf.buffer);
+  dv.setUint8(0, 2);
+  dv.setUint8(1, next.type);
+  dv.setUint16(2, Math.min(65535, Math.round(d)), true);
+  dv.setUint8(4, Math.min(255, kmh));
+  dv.setUint8(5, pts.length);
+  pts.forEach((p, i) => { dv.setInt8(6 + i * 2, p[0]); dv.setInt8(7 + i * 2, p[1]); });
 
   chr.writeValueWithoutResponse(buf.buffer).catch(e => log("Отправка: " + e.message));
 

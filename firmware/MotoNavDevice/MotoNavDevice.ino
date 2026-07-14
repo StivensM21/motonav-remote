@@ -43,11 +43,12 @@
 #define STATE_UUID "6e6f7602-b5a3-f393-e0a9-e50e24dcca9e"
 #define CFG_UUID   "6e6f7603-b5a3-f393-e0a9-e50e24dcca9e"
 
-// ---- цвета RGB565 (та же палитра, что на странице) ----
+// ---- цвета RGB565: тёмно-янтарный, как подсветка приборки BMW E39 ----
 #define C_BG    0x0000
 #define C_INK   0xFFFF
 #define C_DIM   0x8C93
-#define C_AMBER 0xFDA4
+#define C_AMBER 0xFB60   // ~RGB(255,108,0)
+#define C_AMB2  0x79A0   // тот же тон, приглушённый — для подписей
 #define C_MINT  0x6E98
 #define C_RED   0xE2C9
 
@@ -68,6 +69,8 @@ volatile bool navFresh = false;
 volatile uint8_t  navType = 0, navSpd = 0;
 volatile uint16_t navDist = 0;
 volatile uint32_t navAt = 0;
+volatile uint8_t  navN = 0;      // точки дороги впереди (пакет v2)
+int8_t navPX[16], navPY[16];     // пиксельные смещения от якоря
 
 uint8_t battCache = 0;
 
@@ -118,12 +121,26 @@ class SrvCB : public BLEServerCallbacks {
 class NavCB : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
     uint8_t *d = c->getData();
-    if (c->getLength() >= 10 && d[0] == 1) {
+    size_t n = c->getLength();
+    if (n >= 6 && d[0] == 2) {                 // v2: заголовок + форма дороги
       navType = d[1];
       navDist = d[2] | (d[3] << 8);
       navSpd  = d[4];
-      navAt = millis(); navFresh = true;
-      lastActivity = millis();
+      uint8_t k = d[5]; if (k > 16) k = 16;
+      if (n >= (size_t)(6 + k * 2)) {
+        for (uint8_t i = 0; i < k; i++) {
+          navPX[i] = (int8_t)d[6 + i * 2];
+          navPY[i] = (int8_t)d[7 + i * 2];
+        }
+        navN = k;
+      }
+      navAt = millis(); navFresh = true; lastActivity = millis();
+    } else if (n >= 10 && d[0] == 1) {         // v1: без геометрии — просто стрелка
+      navType = d[1];
+      navDist = d[2] | (d[3] << 8);
+      navSpd  = d[4];
+      navN = 0;
+      navAt = millis(); navFresh = true; lastActivity = millis();
     }
   }
 };
@@ -147,27 +164,101 @@ class CfgCB : public BLECharacteristicCallbacks {
 };
 
 // ---- рисование ----
-void textCentered(const char *s, int y, int size, uint16_t color) {
+void textAt(int cx, int y, const char *s, int size, uint16_t color) {
   int w = strlen(s) * 6 * size;
   gfx->setTextSize(size);
   gfx->setTextColor(color);
-  gfx->setCursor(120 - w / 2, y);
+  gfx->setCursor(cx - w / 2, y);
   gfx->print(s);
 }
+void textCentered(const char *s, int y, int size, uint16_t color) { textAt(120, y, s, size, color); }
 
-void drawBatteryBar() {
-  // маленький индикатор внизу круглого экрана
-  int x = 92, y = 208, w = 30, h = 12;
+void drawBatteryBar(int x, int y, bool withText) {
+  int w = 30, h = 12;
   uint16_t c = battCache <= 20 ? C_RED : C_MINT;
   gfx->drawRect(x, y, w, h, C_DIM);
   gfx->fillRect(x + w, y + 3, 3, h - 6, C_DIM);          // носик
   int fw = (w - 4) * battCache / 100;
   if (fw > 0) gfx->fillRect(x + 2, y + 2, fw, h - 4, c);
-  char t[6]; snprintf(t, sizeof(t), "%d%%", battCache);
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_DIM);
-  gfx->setCursor(x + w + 8, y + 2);
-  gfx->print(t);
+  if (withText) {
+    char t[6]; snprintf(t, sizeof(t), "%d%%", battCache);
+    gfx->setTextSize(1);
+    gfx->setTextColor(C_DIM);
+    gfx->setCursor(x + w + 8, y + 2);
+    gfx->print(t);
+  }
+}
+
+// толстая линия из двух треугольников + круглые стыки
+void wideLine(float x0, float y0, float x1, float y1, float w, uint16_t c) {
+  float dx = x1 - x0, dy = y1 - y0, len = sqrtf(dx * dx + dy * dy);
+  if (len < 0.5f) return;
+  float nx = -dy / len * w / 2, ny = dx / len * w / 2;
+  gfx->fillTriangle(x0 + nx, y0 + ny, x0 - nx, y0 - ny, x1 + nx, y1 + ny, c);
+  gfx->fillTriangle(x0 - nx, y0 - ny, x1 - nx, y1 - ny, x1 + nx, y1 + ny, c);
+}
+
+// наконечник стрелки; ang — направление в радианах (0 = вправо, -PI/2 = вверх)
+void arrowHead(float x, float y, float ang, float s, uint16_t c) {
+  gfx->fillTriangle(x + cosf(ang) * s,        y + sinf(ang) * s,
+                    x + cosf(ang + 2.6f) * s, y + sinf(ang + 2.6f) * s,
+                    x + cosf(ang - 2.6f) * s, y + sinf(ang - 2.6f) * s, c);
+}
+
+// маленькая иконка манёвра для нижней строки
+void drawMini(uint8_t type, int cx, int cy) {
+  uint16_t c = C_AMBER;
+  switch (type) {
+    case 0: // прямо
+      wideLine(cx, cy + 14, cx, cy - 4, 5, c);
+      arrowHead(cx, cy - 8, -M_PI / 2, 10, c);
+      break;
+    case 1: // направо
+      wideLine(cx - 8, cy + 14, cx - 8, cy - 4, 5, c);
+      wideLine(cx - 8, cy - 4, cx + 4, cy - 4, 5, c);
+      arrowHead(cx + 8, cy - 4, 0, 10, c);
+      break;
+    case 2: // налево
+      wideLine(cx + 8, cy + 14, cx + 8, cy - 4, 5, c);
+      wideLine(cx + 8, cy - 4, cx - 4, cy - 4, 5, c);
+      arrowHead(cx - 8, cy - 4, M_PI, 10, c);
+      break;
+    case 3: // круговое движение
+      gfx->drawCircle(cx, cy + 2, 7, c);
+      gfx->drawCircle(cx, cy + 2, 8, c);
+      arrowHead(cx, cy - 9, -M_PI / 2, 9, c);
+      break;
+    case 4: // разворот
+      wideLine(cx + 7, cy + 14, cx + 7, cy - 4, 5, c);
+      wideLine(cx + 7, cy - 4, cx - 7, cy - 4, 5, c);
+      wideLine(cx - 7, cy - 4, cx - 7, cy + 4, 5, c);
+      arrowHead(cx - 7, cy + 8, M_PI / 2, 9, c);
+      break;
+    default: { // финиш
+      int s = 6;
+      for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+          gfx->fillRect(cx - 9 + i * s, cy - 8 + j * s, s, s, ((i + j) & 1) ? C_BG : c);
+      gfx->drawRect(cx - 9, cy - 8, 3 * s, 3 * s, C_AMB2);
+    }
+  }
+}
+
+// дорога впереди в стиле Beeline: полоса от шеврона вверх по форме маршрута
+void drawRoad() {
+  const float ax = 120, ay = 168, w = 13;
+  float px = ax, py = ay;
+  for (uint8_t i = 0; i < navN; i++) {
+    float nx = ax + navPX[i], ny = ay - navPY[i];
+    wideLine(px, py, nx, ny, w, C_AMBER);
+    gfx->fillCircle((int16_t)nx, (int16_t)ny, (int16_t)(w / 2) - 1, C_AMBER); // плавные стыки
+    px = nx; py = ny;
+  }
+  // шеврон-указатель в начале дороги
+  gfx->fillTriangle(102, 184, 138, 184, 120, 148, C_AMBER);
+  gfx->drawTriangle(102, 184, 138, 184, 120, 148, C_BG);
+  gfx->fillTriangle(108, 181, 132, 181, 120, 157, C_BG);
+  gfx->fillTriangle(111, 180, 129, 180, 120, 162, C_AMBER);
 }
 
 // стрелка манёвра, центр в (cx, cy)
@@ -214,30 +305,35 @@ void drawScreen() {
   gfx->fillScreen(C_BG);
 
   if (!connected) {
-    textCentered("MotoNav", 84, 4, C_INK);
+    textCentered("MotoNav", 84, 4, C_AMBER);
     textCentered("zhdu telefon...", 130, 2, C_DIM);
-    drawBatteryBar();
+    drawBatteryBar(92, 208, true);
     return;
   }
   if (navAt == 0) {
-    textCentered("MotoNav", 74, 4, C_INK);
+    textCentered("MotoNav", 74, 4, C_AMBER);
     textCentered("na svyazi", 120, 2, C_MINT);
     textCentered("marshruta net", 145, 2, C_DIM);
-    drawBatteryBar();
+    drawBatteryBar(92, 208, true);
     return;
   }
 
-  drawArrow(navType, 120, 78);
+  // верх: батарея и скорость, ненавязчиво
+  drawBatteryBar(104, 8, false);
+  char sp[12]; snprintf(sp, sizeof(sp), "%u km/h", (unsigned)navSpd);
+  textAt(120, 26, sp, 1, C_DIM);
 
-  char d[12];
-  if (navDist >= 1000) snprintf(d, sizeof(d), "%d.%d km", navDist / 1000, (navDist % 1000) / 100);
-  else                 snprintf(d, sizeof(d), "%d m", navDist);
-  textCentered(d, 140, 4, C_INK);
+  // середина: дорога по форме маршрута; без геометрии (пакет v1) — большая стрелка
+  if (navN) drawRoad();
+  else      drawArrow(navType, 120, 84);
 
-  char s[16]; snprintf(s, sizeof(s), "%d km/h", navSpd);
-  textCentered(s, 180, 2, C_DIM);
-
-  drawBatteryBar();
+  // низ: иконка манёвра и дистанция, как на Beeline
+  drawMini(navType, 68, 200);
+  char d[8]; const char *u;
+  if (navDist >= 1000) { snprintf(d, sizeof(d), "%u.%u", (unsigned)(navDist / 1000), (unsigned)((navDist % 1000) / 100)); u = "km"; }
+  else                 { snprintf(d, sizeof(d), "%u", (unsigned)navDist); u = "m"; }
+  textAt(138, 188, d, 4, C_AMBER);
+  textAt(138, 220, u, 2, C_AMB2);
 }
 
 // ---- сон ----
