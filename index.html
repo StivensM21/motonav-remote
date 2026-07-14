@@ -26,6 +26,12 @@
        max-height:160px;overflow:auto;white-space:pre-wrap}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#555;margin-right:6px}
   .dot.on{background:var(--mint)}
+  select{width:100%;background:#171B20;border:1px solid var(--edge);border-radius:6px;color:var(--ink);
+         padding:11px;font-size:16px;margin-bottom:12px}
+  input[type=range]{padding:0;height:32px;accent-color:var(--amber)}
+  .battbar{height:8px;background:#171B20;border:1px solid var(--edge);border-radius:4px;overflow:hidden}
+  .battbar div{height:100%;width:0%;background:var(--mint);transition:width .4s}
+  .battbar div.low{background:#E05A4E}
 </style>
 </head>
 <body>
@@ -51,20 +57,51 @@
   </div>
 </div>
 
+<div class="card" id="devCard" style="display:none">
+  <label>Устройство</label>
+  <div class="row" style="margin-top:0;margin-bottom:14px">
+    <div class="stat"><b id="dBatt">—</b><span id="dBattSub">батарея</span></div>
+    <div class="stat"><b id="dVolt">—</b><span>вольтаж</span></div>
+  </div>
+  <div class="battbar"><div id="battFill"></div></div>
+
+  <label style="margin-top:16px">Спящий режим — уснуть через</label>
+  <select id="cfgSleep">
+    <option value="2">2 минуты</option>
+    <option value="3">3 минуты</option>
+    <option value="5">5 минут</option>
+    <option value="10" selected>10 минут</option>
+    <option value="15">15 минут</option>
+    <option value="30">30 минут</option>
+    <option value="0">Никогда не спать</option>
+  </select>
+
+  <label>Яркость экрана — <span id="cfgBriVal">80</span>%</label>
+  <input type="range" id="cfgBri" min="10" max="100" step="5" value="80">
+
+  <button id="cfgSave" class="ghost">Применить настройки</button>
+</div>
+
 <div class="card"><div id="log">Ожидание.</div></div>
 
 <script>
 const SVC = "6e6f7600-b5a3-f393-e0a9-e50e24dcca9e";
-const CHR = "6e6f7601-b5a3-f393-e0a9-e50e24dcca9e";
+const CHR = "6e6f7601-b5a3-f393-e0a9-e50e24dcca9e"; // навигация: страница → устройство
+// протокол v1, см. PROTOCOL.md в репозитории:
+const CHR_STATE = "6e6f7602-b5a3-f393-e0a9-e50e24dcca9e"; // статус (read/notify): [ver][батарея %][флаги][mV lo][mV hi]
+const CHR_CFG   = "6e6f7603-b5a3-f393-e0a9-e50e24dcca9e"; // настройки (read/write): [ver][сон, мин (0=никогда)][яркость %]
 
-let chr = null, steps = [], watchId = null, wakeLock = null;
+let chr = null, cfgChr = null, steps = [], watchId = null, wakeLock = null;
 const $ = id => document.getElementById(id);
 const log = m => { $('log').textContent = m + "\n" + $('log').textContent; };
 
 // --- BLE ---
 $('connect').onclick = async () => {
   try {
-    const dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
+    const dev = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SVC] }],
+      optionalServices: ['battery_service']
+    });
     const srv = await dev.gatt.connect();
     const s = await srv.getPrimaryService(SVC);
     chr = await s.getCharacteristic(CHR);
@@ -72,9 +109,85 @@ $('connect').onclick = async () => {
     $('go').disabled = false;
     log("Устройство на связи: " + (dev.name || "MotoNav"));
     dev.addEventListener('gattserverdisconnected', () => {
-      chr = null; $('dot').classList.remove('on'); log("Связь потеряна.");
+      chr = null; cfgChr = null;
+      $('dot').classList.remove('on');
+      $('devCard').style.display = 'none';
+      log("Связь потеряна.");
     });
+    await initDevicePanel(srv, s);
   } catch (e) { log("Ошибка BLE: " + e.message); }
+};
+
+// --- панель устройства: батарея + настройки ---
+async function initDevicePanel(srv, s) {
+  let any = false;
+
+  // статус: наша характеристика, иначе стандартный Battery Service
+  try {
+    const st = await s.getCharacteristic(CHR_STATE);
+    const v = await st.readValue();
+    showState(v);
+    await st.startNotifications();
+    st.addEventListener('characteristicvaluechanged', e => showState(e.target.value));
+    any = true;
+  } catch (_) {
+    try {
+      const bs = await srv.getPrimaryService('battery_service');
+      const bc = await bs.getCharacteristic('battery_level');
+      const showBatt = v => setBattery(v.getUint8(0), null, null);
+      showBatt(await bc.readValue());
+      await bc.startNotifications();
+      bc.addEventListener('characteristicvaluechanged', e => showBatt(e.target.value));
+      any = true;
+    } catch (_) { log("Прошивка не отдаёт уровень батареи — нужно обновить устройство."); }
+  }
+
+  // настройки: сон и яркость
+  try {
+    cfgChr = await s.getCharacteristic(CHR_CFG);
+    const v = await cfgChr.readValue();
+    if (v.byteLength >= 3 && v.getUint8(0) === 1) {
+      const sleep = v.getUint8(1), bri = v.getUint8(2);
+      const opt = [...$('cfgSleep').options].find(o => +o.value === sleep);
+      if (opt) opt.selected = true;
+      $('cfgBri').value = Math.max(10, Math.min(100, bri));
+      $('cfgBriVal').textContent = $('cfgBri').value;
+    }
+    any = true;
+  } catch (_) { log("Прошивка не поддерживает настройки сна/яркости — нужно обновить устройство."); }
+
+  if (any) $('devCard').style.display = 'block';
+}
+
+function showState(v) {
+  if (v.byteLength < 2 || v.getUint8(0) !== 1) return;
+  const pct = v.getUint8(1);
+  const charging = v.byteLength >= 3 ? (v.getUint8(2) & 1) : 0;
+  const mv = v.byteLength >= 5 ? v.getUint16(3, true) : null;
+  setBattery(pct, charging, mv);
+}
+
+function setBattery(pct, charging, mv) {
+  $('dBatt').textContent = pct + "%";
+  $('dBattSub').textContent = charging ? "батарея · заряжается" : "батарея";
+  $('dVolt').textContent = mv ? (mv / 1000).toFixed(2) + " В" : "—";
+  const f = $('battFill');
+  f.style.width = pct + "%";
+  f.classList.toggle('low', pct <= 20 && !charging);
+  if (pct <= 15 && !charging) log("Батарея устройства садится: " + pct + "%.");
+}
+
+$('cfgBri').oninput = () => { $('cfgBriVal').textContent = $('cfgBri').value; };
+
+$('cfgSave').onclick = async () => {
+  if (!cfgChr) return log("Настройки недоступны: прошивка их не поддерживает.");
+  const buf = new Uint8Array([1, +$('cfgSleep').value, +$('cfgBri').value]);
+  try {
+    await cfgChr.writeValue(buf);
+    const sleep = +$('cfgSleep').value;
+    log("Настройки применены: сон — " + (sleep ? sleep + " мин" : "никогда") +
+        ", яркость — " + $('cfgBri').value + "%.");
+  } catch (e) { log("Не удалось записать настройки: " + e.message); }
 };
 
 // экран телефона не должен гаснуть, иначе страница встанет
