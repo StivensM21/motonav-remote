@@ -73,7 +73,8 @@ volatile bool navFresh = false;
 volatile uint8_t  navType = 0, navSpd = 0;
 volatile uint16_t navDist = 0;
 volatile uint32_t navAt = 0;
-volatile uint8_t  navN = 0;      // точки дороги впереди (пакет v2)
+volatile uint8_t  navN = 0;      // точки дороги впереди (пакеты v2/v3)
+volatile uint8_t  navProg = 255; // прогресс маршрута 0–100, 255 = неизвестен
 int8_t navPX[16], navPY[16];     // пиксельные смещения от якоря
 
 uint8_t battCache = 0;
@@ -126,10 +127,25 @@ class NavCB : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
     uint8_t *d = c->getData();
     size_t n = c->getLength();
-    if (n >= 6 && d[0] == 2) {                 // v2: заголовок + форма дороги
+    if (n >= 7 && d[0] == 3) {                 // v3: + прогресс маршрута
       navType = d[1];
       navDist = d[2] | (d[3] << 8);
       navSpd  = d[4];
+      navProg = d[5];
+      uint8_t k = d[6]; if (k > 16) k = 16;
+      if (n >= (size_t)(7 + k * 2)) {
+        for (uint8_t i = 0; i < k; i++) {
+          navPX[i] = (int8_t)d[7 + i * 2];
+          navPY[i] = (int8_t)d[8 + i * 2];
+        }
+        navN = k;
+      }
+      navAt = millis(); navFresh = true; lastActivity = millis();
+    } else if (n >= 6 && d[0] == 2) {          // v2: заголовок + форма дороги
+      navType = d[1];
+      navDist = d[2] | (d[3] << 8);
+      navSpd  = d[4];
+      navProg = 255;
       uint8_t k = d[5]; if (k > 16) k = 16;
       if (n >= (size_t)(6 + k * 2)) {
         for (uint8_t i = 0; i < k; i++) {
@@ -143,7 +159,7 @@ class NavCB : public BLECharacteristicCallbacks {
       navType = d[1];
       navDist = d[2] | (d[3] << 8);
       navSpd  = d[4];
-      navN = 0;
+      navN = 0; navProg = 255;
       navAt = millis(); navFresh = true; lastActivity = millis();
     }
   }
@@ -209,34 +225,33 @@ void arrowHead(float x, float y, float ang, float s, uint16_t c) {
                     x + cosf(ang - 2.6f) * s, y + sinf(ang - 2.6f) * s, c);
 }
 
-// маленькая иконка манёвра для нижней строки
+// маленькая иконка манёвра для нижней строки — со скруглёнными поворотами
 void drawMini(uint8_t type, int cx, int cy) {
   uint16_t c = C_AMBER;
   switch (type) {
     case 0: // прямо
-      wideLine(cx, cy + 14, cx, cy - 4, 5, c);
+      segLine(cx, cy + 14, cx, cy - 4, 3, c);
       arrowHead(cx, cy - 8, -M_PI / 2, 10, c);
       break;
-    case 1: // направо
-      wideLine(cx - 8, cy + 14, cx - 8, cy - 4, 5, c);
-      wideLine(cx - 8, cy - 4, cx + 4, cy - 4, 5, c);
-      arrowHead(cx + 8, cy - 4, 0, 10, c);
+    case 1: // направо: стойка, плавная дуга, голова вправо
+      segLine(cx - 9, cy + 14, cx - 9, cy - 1, 3, c);
+      gfx->fillArc(cx, cy - 1, 12, 6, 180, 270, c);
+      arrowHead(cx + 5, cy - 10, 0, 10, c);
       break;
     case 2: // налево
-      wideLine(cx + 8, cy + 14, cx + 8, cy - 4, 5, c);
-      wideLine(cx + 8, cy - 4, cx - 4, cy - 4, 5, c);
-      arrowHead(cx - 8, cy - 4, M_PI, 10, c);
+      segLine(cx + 9, cy + 14, cx + 9, cy - 1, 3, c);
+      gfx->fillArc(cx, cy - 1, 12, 6, 270, 360, c);
+      arrowHead(cx - 5, cy - 10, M_PI, 10, c);
       break;
     case 3: // круговое движение
-      gfx->drawCircle(cx, cy + 2, 7, c);
-      gfx->drawCircle(cx, cy + 2, 8, c);
-      arrowHead(cx, cy - 9, -M_PI / 2, 9, c);
+      gfx->fillArc(cx, cy + 2, 10, 6, 0, 360, c);
+      arrowHead(cx, cy - 11, -M_PI / 2, 9, c);
       break;
-    case 4: // разворот
-      wideLine(cx + 7, cy + 14, cx + 7, cy - 4, 5, c);
-      wideLine(cx + 7, cy - 4, cx - 7, cy - 4, 5, c);
-      wideLine(cx - 7, cy - 4, cx - 7, cy + 4, 5, c);
-      arrowHead(cx - 7, cy + 8, M_PI / 2, 9, c);
+    case 4: // разворот: дуга сверху, голова вниз
+      segLine(cx + 8, cy + 14, cx + 8, cy - 2, 3, c);
+      gfx->fillArc(cx, cy - 2, 11, 5, 180, 360, c);
+      segLine(cx - 8, cy - 2, cx - 8, cy + 2, 3, c);
+      arrowHead(cx - 8, cy + 6, M_PI / 2, 9, c);
       break;
     default: { // финиш
       int s = 6;
@@ -249,26 +264,27 @@ void drawMini(uint8_t type, int cx, int cy) {
 }
 
 // сглаженная кривая Катмулла-Рома через точки маршрута:
-// вдоль неё штампуются кружки — дорога выходит ровной, без изломов на стыках
-void stampPath(const float *xs, const float *ys, int n, int r, uint16_t c) {
+// вдоль неё штампуются кружки, радиус плавно сужается вдаль — перспектива
+void stampPath(const float *xs, const float *ys, int n, float r0, float r1, uint16_t c) {
   for (int i = 0; i < n - 1; i++) {
     int i0 = i > 0 ? i - 1 : 0, i3 = i + 2 < n ? i + 2 : n - 1;
     float p0x = xs[i0], p0y = ys[i0], p1x = xs[i], p1y = ys[i];
     float p2x = xs[i + 1], p2y = ys[i + 1], p3x = xs[i3], p3y = ys[i3];
-    int st = (int)(hypotf(p2x - p1x, p2y - p1y) / 2);
+    int st = (int)(hypotf(p2x - p1x, p2y - p1y) / 1.5f);
     if (st < 2) st = 2;
     for (int k = 0; k <= st; k++) {
       float t = (float)k / st, t2 = t * t, t3 = t2 * t;
       float x = 0.5f * (2*p1x + (-p0x + p2x)*t + (2*p0x - 5*p1x + 4*p2x - p3x)*t2 + (-p0x + 3*p1x - 3*p2x + p3x)*t3);
       float y = 0.5f * (2*p1y + (-p0y + p2y)*t + (2*p0y - 5*p1y + 4*p2y - p3y)*t2 + (-p0y + 3*p1y - 3*p2y + p3y)*t3);
-      gfx->fillCircle((int16_t)x, (int16_t)y, r, c);
+      float u = ((float)i + t) / (float)(n - 1);     // 0 у шеврона → 1 вдали
+      gfx->fillCircle((int16_t)x, (int16_t)y, (int16_t)(r0 + (r1 - r0) * u), c);
     }
   }
 }
 
 // дорога впереди в стиле Beeline: гладкая полоса от шеврона вверх по форме маршрута
 void drawRoad() {
-  const float ax = 120, ay = 168;
+  const float ax = 120, ay = 150;
   float xs[17], ys[17];
   int n = 0;
   xs[n] = ax; ys[n] = ay; n++;                       // старт — у шеврона
@@ -276,13 +292,55 @@ void drawRoad() {
     xs[n] = ax + navPX[i]; ys[n] = ay - navPY[i]; n++;
   }
   if (n < 2) return;
-  stampPath(xs, ys, n, 8, C_AMB2);                   // тёмная кромка
-  stampPath(xs, ys, n, 6, C_AMBER);                  // сердцевина
-  // шеврон-указатель в начале дороги
-  gfx->fillTriangle(102, 184, 138, 184, 120, 148, C_AMBER);
-  gfx->drawTriangle(102, 184, 138, 184, 120, 148, C_BG);
-  gfx->fillTriangle(108, 181, 132, 181, 120, 157, C_BG);
-  gfx->fillTriangle(111, 180, 129, 180, 120, 162, C_AMBER);
+  stampPath(xs, ys, n, 10, 6, C_AMB2);               // тёмная кромка
+  stampPath(xs, ys, n, 8, 4, C_AMBER);               // сердцевина
+  // зазор и шеврон-указатель, как на Beeline
+  gfx->fillTriangle(98, 186, 142, 186, 120, 138, C_BG);
+  gfx->fillTriangle(104, 180, 136, 180, 120, 146, C_AMBER);
+}
+
+// ---- крупные сегментные цифры (гладкие, из штампованных штрихов) ----
+void segLine(float x0, float y0, float x1, float y1, float r, uint16_t c) {
+  float dx = x1 - x0, dy = y1 - y0;
+  int st = (int)(hypotf(dx, dy) / 2) + 1;
+  for (int k = 0; k <= st; k++) {
+    float t = (float)k / st;
+    gfx->fillCircle((int16_t)(x0 + dx * t), (int16_t)(y0 + dy * t), (int16_t)r, c);
+  }
+}
+
+void drawDigit(char ch, float x, float y, float w, float h, uint16_t c) {
+  static const uint8_t M[10] = {0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F};
+  if (ch < '0' || ch > '9') return;
+  uint8_t m = M[ch - '0'];
+  float r = 3.0f, m2 = y + h / 2;
+  if (m & 1)  segLine(x + r, y, x + w - r, y, r, c);            // верх
+  if (m & 2)  segLine(x + w, y + r, x + w, m2 - r, r, c);       // правый верх
+  if (m & 4)  segLine(x + w, m2 + r, x + w, y + h - r, r, c);   // правый низ
+  if (m & 8)  segLine(x + r, y + h, x + w - r, y + h, r, c);    // низ
+  if (m & 16) segLine(x, m2 + r, x, y + h - r, r, c);           // левый низ
+  if (m & 32) segLine(x, y + r, x, m2 - r, r, c);               // левый верх
+  if (m & 64) segLine(x + r, m2, x + w - r, m2, r, c);          // середина
+}
+
+void drawNumber(const char *s, int cx, int y, float h, uint16_t c) {
+  const float w = 20, gap = 9;
+  int n = strlen(s);
+  float total = 0;
+  for (int i = 0; i < n; i++) total += (s[i] == '.' ? 8 : w) + (i < n - 1 ? gap : 0);
+  float x = cx - total / 2;
+  for (int i = 0; i < n; i++) {
+    if (s[i] == '.') { gfx->fillCircle((int16_t)(x + 4), (int16_t)(y + h), 4, c); x += 8 + gap; }
+    else             { drawDigit(s[i], x, y, w, h, c);                            x += w + gap; }
+  }
+}
+
+// дуга прогресса маршрута по нижнему краю, слева направо
+void drawProgressArc() {
+  if (navProg > 100) return;
+  gfx->fillArc(120, 120, 118, 114, 45, 135, C_AMB2);
+  if (navProg > 0)
+    gfx->fillArc(120, 120, 118, 114, 135 - 0.9f * navProg, 135, C_AMBER);
 }
 
 // стрелка манёвра, центр в (cx, cy)
@@ -342,22 +400,23 @@ void drawScreen() {
     return;
   }
 
-  // верх: батарея и скорость, ненавязчиво
+  // дорога — фоном, статус и цифры поверх неё
+  if (navN) drawRoad();
+  else      drawArrow(navType, 120, 84);
+
   drawBatteryBar(104, 8, false);
   char sp[12]; snprintf(sp, sizeof(sp), "%u km/h", (unsigned)navSpd);
   textAt(120, 26, sp, 1, C_DIM);
 
-  // середина: дорога по форме маршрута; без геометрии (пакет v1) — большая стрелка
-  if (navN) drawRoad();
-  else      drawArrow(navType, 120, 84);
-
-  // низ: иконка манёвра и дистанция, как на Beeline
-  drawMini(navType, 68, 200);
+  // низ: иконка манёвра и дистанция сегментными цифрами, как на Beeline
+  drawMini(navType, 62, 198);
   char d[8]; const char *u;
   if (navDist >= 1000) { snprintf(d, sizeof(d), "%u.%u", (unsigned)(navDist / 1000), (unsigned)((navDist % 1000) / 100)); u = "km"; }
   else                 { snprintf(d, sizeof(d), "%u", (unsigned)navDist); u = "m"; }
-  textAt(138, 188, d, 4, C_AMBER);
-  textAt(138, 220, u, 2, C_AMB2);
+  drawNumber(d, 134, 184, 32, C_AMBER);
+  textAt(134, 224, u, 1, C_AMB2);
+
+  drawProgressArc();
 }
 
 // ---- сон ----

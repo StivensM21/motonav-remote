@@ -82,7 +82,7 @@
   <button id="cfgSave" class="ghost">Применить настройки</button>
 </div>
 
-<div class="card"><div id="log">Ожидание. Страница v2 — с дорогой.</div></div>
+<div class="card"><div id="log">Ожидание. Страница v3 — дорога и прогресс.</div></div>
 
 <script>
 const SVC = "6e6f7600-b5a3-f393-e0a9-e50e24dcca9e";
@@ -93,6 +93,7 @@ const CHR_CFG   = "6e6f7603-b5a3-f393-e0a9-e50e24dcca9e"; // настройки 
 
 let chr = null, cfgChr = null, steps = [], watchId = null, wakeLock = null;
 let routeGeom = [], gIdx = 0, lastPos = null; // геометрия маршрута для отрисовки дороги на устройстве
+let cumDist = [0];                            // накопленная дистанция вдоль геометрии — для дуги прогресса
 const $ = id => document.getElementById(id);
 const log = m => { $('log').textContent = m + "\n" + $('log').textContent; };
 
@@ -240,6 +241,10 @@ $('go').onclick = async () => {
     done: false
   }));
   routeGeom = r.routes[0].geometry.coordinates.map(c => ({ lat: c[1], lon: c[0] }));
+  cumDist = [0];
+  for (let i = 1; i < routeGeom.length; i++)
+    cumDist[i] = cumDist[i - 1] + haversine(routeGeom[i-1].lat, routeGeom[i-1].lon,
+                                            routeGeom[i].lat, routeGeom[i].lon);
   gIdx = 0; lastPos = null;
   log(`Маршрут готов: ${steps.length} манёвров, ${(r.routes[0].distance/1000).toFixed(1)} км.`);
   startRide();
@@ -325,15 +330,18 @@ function onFix(pos) {
               Math.max(-127, Math.min(127, Math.round(y * S)))]);
   }
 
-  // пакет v2: заголовок + форма дороги (см. PROTOCOL.md)
-  const buf = new Uint8Array(6 + pts.length * 2);
+  // пакет v3: заголовок + прогресс маршрута + форма дороги (см. PROTOCOL.md)
+  const total = cumDist[cumDist.length - 1] || 1;
+  const prog = Math.max(0, Math.min(100, Math.round((cumDist[gIdx] || 0) / total * 100)));
+  const buf = new Uint8Array(7 + pts.length * 2);
   const dv = new DataView(buf.buffer);
-  dv.setUint8(0, 2);
+  dv.setUint8(0, 3);
   dv.setUint8(1, next.type);
   dv.setUint16(2, Math.min(65535, Math.round(d)), true);
   dv.setUint8(4, Math.min(255, kmh));
-  dv.setUint8(5, pts.length);
-  pts.forEach((p, i) => { dv.setInt8(6 + i * 2, p[0]); dv.setInt8(7 + i * 2, p[1]); });
+  dv.setUint8(5, prog);
+  dv.setUint8(6, pts.length);
+  pts.forEach((p, i) => { dv.setInt8(7 + i * 2, p[0]); dv.setInt8(8 + i * 2, p[1]); });
 
   chr.writeValueWithoutResponse(buf.buffer).catch(e => log("Отправка: " + e.message));
 
