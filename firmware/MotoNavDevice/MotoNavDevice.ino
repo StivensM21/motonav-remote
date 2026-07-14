@@ -53,7 +53,11 @@
 #define C_RED   0xE2C9
 
 Arduino_DataBus *bus = new Arduino_ESP32SPI(PIN_LCD_DC, PIN_LCD_CS, PIN_LCD_SCK, PIN_LCD_MOSI, PIN_LCD_MISO);
-Arduino_GFX *gfx = new Arduino_GC9A01(bus, PIN_LCD_RST, 0 /* поворот */, true /* IPS */);
+Arduino_GC9A01 *panel = new Arduino_GC9A01(bus, PIN_LCD_RST, 0 /* поворот */, true /* IPS */);
+// кадр собирается в буфере в памяти и выводится целиком — без мерцания
+Arduino_Canvas *canvas = new Arduino_Canvas(240, 240, panel);
+Arduino_GFX *gfx = canvas;
+bool buffered = true;
 
 Preferences prefs;
 BLECharacteristic *stateChr, *cfgChr;
@@ -244,16 +248,36 @@ void drawMini(uint8_t type, int cx, int cy) {
   }
 }
 
-// дорога впереди в стиле Beeline: полоса от шеврона вверх по форме маршрута
-void drawRoad() {
-  const float ax = 120, ay = 168, w = 13;
-  float px = ax, py = ay;
-  for (uint8_t i = 0; i < navN; i++) {
-    float nx = ax + navPX[i], ny = ay - navPY[i];
-    wideLine(px, py, nx, ny, w, C_AMBER);
-    gfx->fillCircle((int16_t)nx, (int16_t)ny, (int16_t)(w / 2) - 1, C_AMBER); // плавные стыки
-    px = nx; py = ny;
+// сглаженная кривая Катмулла-Рома через точки маршрута:
+// вдоль неё штампуются кружки — дорога выходит ровной, без изломов на стыках
+void stampPath(const float *xs, const float *ys, int n, int r, uint16_t c) {
+  for (int i = 0; i < n - 1; i++) {
+    int i0 = i > 0 ? i - 1 : 0, i3 = i + 2 < n ? i + 2 : n - 1;
+    float p0x = xs[i0], p0y = ys[i0], p1x = xs[i], p1y = ys[i];
+    float p2x = xs[i + 1], p2y = ys[i + 1], p3x = xs[i3], p3y = ys[i3];
+    int st = (int)(hypotf(p2x - p1x, p2y - p1y) / 2);
+    if (st < 2) st = 2;
+    for (int k = 0; k <= st; k++) {
+      float t = (float)k / st, t2 = t * t, t3 = t2 * t;
+      float x = 0.5f * (2*p1x + (-p0x + p2x)*t + (2*p0x - 5*p1x + 4*p2x - p3x)*t2 + (-p0x + 3*p1x - 3*p2x + p3x)*t3);
+      float y = 0.5f * (2*p1y + (-p0y + p2y)*t + (2*p0y - 5*p1y + 4*p2y - p3y)*t2 + (-p0y + 3*p1y - 3*p2y + p3y)*t3);
+      gfx->fillCircle((int16_t)x, (int16_t)y, r, c);
+    }
   }
+}
+
+// дорога впереди в стиле Beeline: гладкая полоса от шеврона вверх по форме маршрута
+void drawRoad() {
+  const float ax = 120, ay = 168;
+  float xs[17], ys[17];
+  int n = 0;
+  xs[n] = ax; ys[n] = ay; n++;                       // старт — у шеврона
+  for (uint8_t i = 0; i < navN && n < 17; i++) {
+    xs[n] = ax + navPX[i]; ys[n] = ay - navPY[i]; n++;
+  }
+  if (n < 2) return;
+  stampPath(xs, ys, n, 8, C_AMB2);                   // тёмная кромка
+  stampPath(xs, ys, n, 6, C_AMBER);                  // сердцевина
   // шеврон-указатель в начале дороги
   gfx->fillTriangle(102, 184, 138, 184, 120, 148, C_AMBER);
   gfx->drawTriangle(102, 184, 138, 184, 120, 148, C_BG);
@@ -305,15 +329,15 @@ void drawScreen() {
   gfx->fillScreen(C_BG);
 
   if (!connected) {
-    textCentered("MotoNav", 84, 4, C_AMBER);
-    textCentered("zhdu telefon...", 130, 2, C_DIM);
+    textCentered("GPS", 78, 5, C_AMBER);
+    textCentered("Ready for the trip", 132, 2, C_DIM);
     drawBatteryBar(92, 208, true);
     return;
   }
   if (navAt == 0) {
-    textCentered("MotoNav", 74, 4, C_AMBER);
-    textCentered("na svyazi", 120, 2, C_MINT);
-    textCentered("marshruta net", 145, 2, C_DIM);
+    textCentered("GPS", 68, 5, C_AMBER);
+    textCentered("connected", 122, 2, C_MINT);
+    textCentered("no route yet", 147, 2, C_DIM);
     drawBatteryBar(92, 208, true);
     return;
   }
@@ -340,9 +364,10 @@ void drawScreen() {
 void goToSleep() {
   gfx->fillScreen(C_BG);
   textCentered("sleep...", 110, 3, C_DIM);
+  if (buffered) canvas->flush();
   delay(600);
   analogWrite(PIN_LCD_BL, 0);
-  gfx->displayOff();
+  panel->displayOff();
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_TP_INT, 0); // касание экрана будит
   esp_deep_sleep_start();
 }
@@ -357,7 +382,10 @@ void setup() {
   pinMode(PIN_TP_INT, INPUT);
   attachInterrupt(digitalPinToInterrupt(PIN_TP_INT), touchISR, FALLING);
 
-  gfx->begin();
+  if (!canvas->begin()) {           // не хватило памяти под буфер (PSRAM выключен?)
+    buffered = false; gfx = panel;  // — рисуем напрямую, без сглаживания кадра
+    panel->begin();
+  }
   applyBrightness();
 
   BLEDevice::init("MotoNav");
@@ -400,6 +428,7 @@ void loop() {
   if (navFresh && now - lastDraw > 250) {
     navFresh = false; lastDraw = now;
     drawScreen();
+    if (buffered) canvas->flush();
   }
 
   if (now - lastBatt > 10000) {
