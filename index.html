@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MotoNav — пульт</title>
+<style>
+  :root{--bg:#0E1013;--card:#21252B;--edge:#3A4048;--ink:#F4F3EF;--dim:#8A929C;--amber:#FFB627;--mint:#6FD3C7}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);font-family:system-ui,sans-serif;padding:20px;min-height:100vh}
+  h1{font-size:20px;letter-spacing:.05em;text-transform:uppercase;margin-bottom:4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:20px}
+  .card{background:var(--card);border:1px solid var(--edge);border-radius:10px;padding:16px;margin-bottom:14px}
+  label{display:block;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:6px}
+  input{width:100%;background:#171B20;border:1px solid var(--edge);border-radius:6px;color:var(--ink);
+        padding:11px;font-size:16px;margin-bottom:12px}
+  button{width:100%;padding:14px;border:0;border-radius:8px;font-size:15px;font-weight:600;
+         background:var(--amber);color:#151719;cursor:pointer;margin-bottom:8px}
+  button.ghost{background:#2C323A;color:var(--ink);border:1px solid var(--edge)}
+  button:disabled{opacity:.4}
+  .row{display:flex;gap:20px;margin-top:10px}
+  .stat{flex:1}
+  .stat b{display:block;font-size:26px}
+  .stat span{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+  #log{font-family:ui-monospace,monospace;font-size:12px;color:var(--dim);line-height:1.6;
+       max-height:160px;overflow:auto;white-space:pre-wrap}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#555;margin-right:6px}
+  .dot.on{background:var(--mint)}
+</style>
+</head>
+<body>
+<h1>MotoNav</h1>
+<div class="sub">Телефон считает маршрут. Устройство только рисует. Приложение ставить не нужно — это страница.</div>
+
+<div class="card">
+  <button id="connect"><span class="dot" id="dot"></span>Подключить устройство</button>
+  <button id="wake" class="ghost">Не гасить экран телефона</button>
+</div>
+
+<div class="card">
+  <label>Куда едем — адрес или координаты</label>
+  <input id="dest" placeholder="Weerschip 59, Almere — или 52.37, 4.89" value="">
+  <button id="go" disabled>Построить маршрут и поехали</button>
+</div>
+
+<div class="card">
+  <div class="row">
+    <div class="stat"><b id="mDist">—</b><span>до поворота</span></div>
+    <div class="stat"><b id="mType">—</b><span>манёвр</span></div>
+    <div class="stat"><b id="mSpd">0</b><span>км/ч</span></div>
+  </div>
+</div>
+
+<div class="card"><div id="log">Ожидание.</div></div>
+
+<script>
+const SVC = "6e6f7600-b5a3-f393-e0a9-e50e24dcca9e";
+const CHR = "6e6f7601-b5a3-f393-e0a9-e50e24dcca9e";
+
+let chr = null, steps = [], watchId = null, wakeLock = null;
+const $ = id => document.getElementById(id);
+const log = m => { $('log').textContent = m + "\n" + $('log').textContent; };
+
+// --- BLE ---
+$('connect').onclick = async () => {
+  try {
+    const dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
+    const srv = await dev.gatt.connect();
+    const s = await srv.getPrimaryService(SVC);
+    chr = await s.getCharacteristic(CHR);
+    $('dot').classList.add('on');
+    $('go').disabled = false;
+    log("Устройство на связи: " + (dev.name || "MotoNav"));
+    dev.addEventListener('gattserverdisconnected', () => {
+      chr = null; $('dot').classList.remove('on'); log("Связь потеряна.");
+    });
+  } catch (e) { log("Ошибка BLE: " + e.message); }
+};
+
+// экран телефона не должен гаснуть, иначе страница встанет
+$('wake').onclick = async () => {
+  try { wakeLock = await navigator.wakeLock.request('screen'); log("Экран телефона удержан."); }
+  catch (e) { log("Wake Lock недоступен: " + e.message +
+                  " — обычно это режим энергосбережения. Выключи Battery Saver или поставь телефон на зарядку."); }
+};
+
+// --- назначение: координаты ИЛИ адрес текстом ---
+async function resolveDest(text) {
+  const parts = text.split(',').map(v => parseFloat(v.trim()));
+  if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+    return { lat: parts[0], lon: parts[1] };         // это уже координаты
+  }
+  // это адрес — геокодим через Nominatim (OpenStreetMap)
+  log("Ищу адрес…");
+  const url = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" +
+              encodeURIComponent(text);
+  const r = await fetch(url).then(x => x.json());
+  if (!r.length) { log("Адрес не найден. Уточни или введи координаты."); return null; }
+  log("Нашёл: " + r[0].display_name);
+  return { lat: parseFloat(r[0].lat), lon: parseFloat(r[0].lon) };
+}
+
+// --- маршрут через OSRM ---
+$('go').onclick = async () => {
+  const dest = await resolveDest($('dest').value);
+  if (!dest) return;
+  const { lat, lon } = dest;
+
+  const me = await new Promise((res, rej) =>
+    navigator.geolocation.getCurrentPosition(res, rej, { enableHighAccuracy: true }));
+
+  const from = `${me.coords.longitude},${me.coords.latitude}`;
+  const to = `${lon},${lat}`;
+  const url = `https://router.project-osrm.org/route/v1/driving/${from};${to}` +
+              `?overview=false&steps=true&annotations=false`;
+
+  log("Считаю маршрут…");
+  const r = await fetch(url).then(x => x.json());
+  if (r.code !== 'Ok') return log("OSRM отказал: " + r.code);
+
+  // манёвры → плоский список с координатами точки поворота
+  steps = r.routes[0].legs[0].steps.map(s => ({
+    lat: s.maneuver.location[1],
+    lon: s.maneuver.location[0],
+    type: mapType(s.maneuver),
+    done: false
+  }));
+  log(`Маршрут готов: ${steps.length} манёвров, ${(r.routes[0].distance/1000).toFixed(1)} км.`);
+  startRide();
+};
+
+// OSRM → наш enum: 0 прямо, 1 направо, 2 налево, 3 круговой, 4 разворот, 5 финиш
+function mapType(m) {
+  if (m.type === 'arrive') return 5;
+  if (m.type === 'roundabout' || m.type === 'rotary') return 3;
+  const mod = m.modifier || '';
+  if (mod === 'uturn') return 4;
+  if (mod.includes('right')) return 1;
+  if (mod.includes('left')) return 2;
+  return 0;
+}
+
+// --- поездка: раз в секунду шлём 10 байт ---
+function startRide() {
+  if (watchId) navigator.geolocation.clearWatch(watchId);
+  watchId = navigator.geolocation.watchPosition(onFix, e => log("GPS: " + e.message),
+                                                { enableHighAccuracy: true, maximumAge: 1000 });
+}
+
+function haversine(a, b, c, d) {
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (c - a) * r, dLon = (d - b) * r;
+  const s = Math.sin(dLat/2)**2 + Math.cos(a*r) * Math.cos(c*r) * Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+let lastSend = 0;
+function onFix(pos) {
+  if (!chr || !steps.length) return;
+  if (Date.now() - lastSend < 1000) return;          // не чаще 1 Гц — бережём батарею
+  lastSend = Date.now();
+
+  const { latitude: la, longitude: lo, speed } = pos.coords;
+
+  // ближайший невыполненный манёвр
+  const next = steps.find(s => !s.done);
+  if (!next) return;
+  const d = haversine(la, lo, next.lat, next.lon);
+  if (d < 25) { next.done = true; }                  // поворот пройден
+
+  const kmh = Math.round((speed || 0) * 3.6);
+  const remaining = steps.filter(s => !s.done).length;
+  const eta = Math.round(d / 1000 / Math.max(20, kmh) * 60);
+
+  const buf = new DataView(new ArrayBuffer(10));
+  buf.setUint8(0, 1);                                // версия протокола
+  buf.setUint8(1, next.type);
+  buf.setUint16(2, Math.min(65535, Math.round(d)), true);
+  buf.setUint8(4, Math.min(255, kmh));
+  buf.setUint8(5, 0);                                // флаги: сход/перестроение сюда
+  buf.setUint16(6, Math.min(65535, Math.round(d / 10)), true);
+  buf.setUint16(8, Math.min(65535, eta), true);
+
+  chr.writeValueWithoutResponse(buf.buffer).catch(e => log("Отправка: " + e.message));
+
+  $('mDist').textContent = Math.round(d) + " м";
+  $('mType').textContent = ['прямо','направо','налево','круг','разворот','финиш'][next.type];
+  $('mSpd').textContent = kmh;
+}
+</script>
+</body>
+</html>
