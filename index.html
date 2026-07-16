@@ -82,7 +82,7 @@
   <button id="cfgSave" class="ghost">Применить настройки</button>
 </div>
 
-<div class="card"><div id="log">Ожидание. Страница v3 — дорога и прогресс.</div></div>
+<div class="card"><div id="log">Ожидание. Страница v4 — перестроение и съезды.</div></div>
 
 <script>
 const SVC = "6e6f7600-b5a3-f393-e0a9-e50e24dcca9e";
@@ -216,38 +216,48 @@ async function resolveDest(text) {
 }
 
 // --- маршрут через OSRM ---
-$('go').onclick = async () => {
-  const dest = await resolveDest($('dest').value);
-  if (!dest) return;
-  const { lat, lon } = dest;
+let destLL = null, rerouting = false, lastReroute = 0;
 
-  const me = await new Promise((res, rej) =>
-    navigator.geolocation.getCurrentPosition(res, rej, { enableHighAccuracy: true }));
-
-  const from = `${me.coords.longitude},${me.coords.latitude}`;
-  const to = `${lon},${lat}`;
+async function buildRoute(fromLat, fromLon, quiet) {
+  if (!destLL) return false;
+  const from = `${fromLon},${fromLat}`;
+  const to = `${destLL.lon},${destLL.lat}`;
   const url = `https://router.project-osrm.org/route/v1/driving/${from};${to}` +
               `?overview=full&geometries=geojson&steps=true&annotations=false`;
+  if (!quiet) log("Считаю маршрут…");
+  let r;
+  try { r = await fetch(url).then(x => x.json()); }
+  catch (e) { log("Сеть недоступна для маршрута: " + e.message); return false; }
+  if (r.code !== 'Ok') { log("OSRM отказал: " + r.code); return false; }
 
-  log("Считаю маршрут…");
-  const r = await fetch(url).then(x => x.json());
-  if (r.code !== 'Ok') return log("OSRM отказал: " + r.code);
-
-  // манёвры → плоский список с координатами точки поворота
-  steps = r.routes[0].legs[0].steps.map(s => ({
-    lat: s.maneuver.location[1],
-    lon: s.maneuver.location[0],
-    type: mapType(s.maneuver),
-    done: false
-  }));
+  // манёвры → координата поворота + боковые съезды перекрёстка (для #5)
+  steps = r.routes[0].legs[0].steps.map(s => {
+    const it = (s.intersections && s.intersections[0]) || null;
+    let side = [];
+    if (it && it.bearings) {
+      const skip = new Set([it.bearings[it.in], it.bearings[it.out]]);
+      side = it.bearings.filter(b => !skip.has(b));   // абсолютные азимуты боковых дорог
+    }
+    return { lat: s.maneuver.location[1], lon: s.maneuver.location[0],
+             type: mapType(s.maneuver), side, done: false };
+  });
   routeGeom = r.routes[0].geometry.coordinates.map(c => ({ lat: c[1], lon: c[0] }));
   cumDist = [0];
   for (let i = 1; i < routeGeom.length; i++)
     cumDist[i] = cumDist[i - 1] + haversine(routeGeom[i-1].lat, routeGeom[i-1].lon,
                                             routeGeom[i].lat, routeGeom[i].lon);
   gIdx = 0; lastPos = null;
-  log(`Маршрут готов: ${steps.length} манёвров, ${(r.routes[0].distance/1000).toFixed(1)} км.`);
-  startRide();
+  if (!quiet) log(`Маршрут готов: ${steps.length} манёвров, ${(r.routes[0].distance/1000).toFixed(1)} км.`);
+  return true;
+}
+
+$('go').onclick = async () => {
+  const dest = await resolveDest($('dest').value);
+  if (!dest) return;
+  destLL = dest;
+  const me = await new Promise((res, rej) =>
+    navigator.geolocation.getCurrentPosition(res, rej, { enableHighAccuracy: true }));
+  if (await buildRoute(me.coords.latitude, me.coords.longitude, false)) startRide();
 };
 
 // OSRM → наш enum: 0 прямо, 1 направо, 2 налево, 3 круговой, 4 разворот, 5 финиш
@@ -286,7 +296,7 @@ function bearingTo(la1, lo1, la2, lo2) {
 let lastSend = 0;
 function onFix(pos) {
   if (!chr || !steps.length) return;
-  if (Date.now() - lastSend < 1000) return;          // не чаще 1 Гц — бережём батарею
+  if (Date.now() - lastSend < 350) return;           // ~3 Гц — меньше задержки в движении
   lastSend = Date.now();
 
   const { latitude: la, longitude: lo, speed, heading } = pos.coords;
@@ -314,34 +324,64 @@ function onFix(pos) {
          haversine(la, lo, routeGeom[gIdx + 1].lat, routeGeom[gIdx + 1].lon) <=
          haversine(la, lo, routeGeom[gIdx].lat, routeGeom[gIdx].lon)) gIdx++;
 
-  // дорога впереди (~450 м) → пиксели экрана устройства, курс всегда «вверх»
-  const hr = hdg * Math.PI / 180, S = 0.45, pts = [];
-  let acc = 0, prev = { lat: la, lon: lo };
-  for (let i = gIdx + 1; i < routeGeom.length && pts.length < 15 && acc < 450; i++) {
-    const p = routeGeom[i];
-    const seg = haversine(prev.lat, prev.lon, p.lat, p.lon);
-    if (seg < 12 && i < routeGeom.length - 1) continue;   // прореживаем плотные точки
-    acc += seg; prev = p;
-    const e = (p.lon - lo) * Math.cos(la * Math.PI / 180) * 111320;
-    const n = (p.lat - la) * 110540;
-    const x = e * Math.cos(hr) - n * Math.sin(hr);
-    const y = e * Math.sin(hr) + n * Math.cos(hr);
-    pts.push([Math.max(-127, Math.min(127, Math.round(x * S))),
-              Math.max(-127, Math.min(127, Math.round(y * S)))]);
+  // #3 — съезд с маршрута: далеко от линии → автоматически перестроить
+  const offDist = haversine(la, lo, routeGeom[gIdx].lat, routeGeom[gIdx].lon);
+  if (offDist > 45 && !rerouting && Date.now() - lastReroute > 8000) {
+    rerouting = true; lastReroute = Date.now();
+    log("Съехал с маршрута — перестраиваю…");
+    buildRoute(la, lo, true).then(ok => {
+      rerouting = false; log(ok ? "Маршрут перестроен." : "Не удалось перестроить.");
+    });
   }
 
-  // пакет v3: заголовок + прогресс маршрута + форма дороги (см. PROTOCOL.md)
+  const hr = hdg * Math.PI / 180, S = 0.45;
+  const rot = (lat2, lon2) => {                       // точка (lat,lon) → пиксели, курс вверх
+    const e = (lon2 - lo) * Math.cos(la * Math.PI / 180) * 111320;
+    const n = (lat2 - la) * 110540;
+    return [e * Math.cos(hr) - n * Math.sin(hr), e * Math.sin(hr) + n * Math.cos(hr)];
+  };
+  const clamp = v => Math.max(-127, Math.min(127, Math.round(v)));
+
+  // дорога впереди (~450 м) → пиксели; плотнее точки = глаже линия (#1)
+  const pts = [];
+  let acc = 0, prev = { lat: la, lon: lo };
+  for (let i = gIdx + 1; i < routeGeom.length && pts.length < 16 && acc < 450; i++) {
+    const p = routeGeom[i];
+    const seg = haversine(prev.lat, prev.lon, p.lat, p.lon);
+    if (seg < 8 && i < routeGeom.length - 1) continue;    // лёгкое прореживание
+    acc += seg; prev = p;
+    const [x, y] = rot(p.lat, p.lon);
+    pts.push([clamp(x * S), clamp(y * S)]);
+  }
+
+  // #5 — боковые съезды у ближайшего поворота (если он в поле зрения)
+  const [mxr, myr] = rot(next.lat, next.lon);
+  const mx = mxr * S, my = myr * S;
+  const manOn = Math.abs(mx) < 118 && (182 - my) > 6 && (182 - my) < 236;
+  const stubs = [];
+  if (manOn && next.side) for (const b of next.side.slice(0, 6)) {
+    const th = b * Math.PI / 180, e = Math.sin(th), n = Math.cos(th);   // азимут съезда
+    const sx = (e * Math.cos(hr) - n * Math.sin(hr)) * 22;
+    const sy = (e * Math.sin(hr) + n * Math.cos(hr)) * 22;
+    stubs.push([clamp(sx), clamp(sy)]);
+  }
+
+  // пакет v4: заголовок + дорога + точка поворота + боковые съезды (см. PROTOCOL.md)
   const total = cumDist[cumDist.length - 1] || 1;
   const prog = Math.max(0, Math.min(100, Math.round((cumDist[gIdx] || 0) / total * 100)));
-  const buf = new Uint8Array(7 + pts.length * 2);
+  const buf = new Uint8Array(10 + pts.length * 2 + stubs.length * 2);
   const dv = new DataView(buf.buffer);
-  dv.setUint8(0, 3);
+  dv.setUint8(0, 4);
   dv.setUint8(1, next.type);
   dv.setUint16(2, Math.min(65535, Math.round(d)), true);
   dv.setUint8(4, Math.min(255, kmh));
   dv.setUint8(5, prog);
   dv.setUint8(6, pts.length);
   pts.forEach((p, i) => { dv.setInt8(7 + i * 2, p[0]); dv.setInt8(8 + i * 2, p[1]); });
+  let o = 7 + pts.length * 2;
+  dv.setInt8(o, manOn ? clamp(mx) : -128); dv.setInt8(o + 1, manOn ? clamp(my) : -128);
+  dv.setUint8(o + 2, stubs.length);
+  stubs.forEach((p, i) => { dv.setInt8(o + 3 + i * 2, p[0]); dv.setInt8(o + 4 + i * 2, p[1]); });
 
   chr.writeValueWithoutResponse(buf.buffer).catch(e => log("Отправка: " + e.message));
 

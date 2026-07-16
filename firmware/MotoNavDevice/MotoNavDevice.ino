@@ -74,9 +74,12 @@ volatile bool navFresh = false;
 volatile uint8_t  navType = 0, navSpd = 0;
 volatile uint16_t navDist = 0;
 volatile uint32_t navAt = 0;
-volatile uint8_t  navN = 0;      // точки дороги впереди (пакеты v2/v3)
+volatile uint8_t  navN = 0;      // точки дороги впереди (пакеты v2/v3/v4)
 volatile uint8_t  navProg = 255; // прогресс маршрута 0–100, 255 = неизвестен
 int8_t navPX[16], navPY[16];     // пиксельные смещения от якоря
+volatile int8_t   navMX = -128, navMY = -128;  // точка поворота на экране (-128 = вне экрана)
+volatile uint8_t  navStubN = 0;  // боковые съезды у поворота (пакет v4)
+int8_t navSX[6], navSY[6];       // направления съездов, пиксели
 
 uint8_t battCache = 0;
 
@@ -128,11 +131,38 @@ class NavCB : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
     uint8_t *d = c->getData();
     size_t n = c->getLength();
-    if (n >= 7 && d[0] == 3) {                 // v3: + прогресс маршрута
+    if (n >= 10 && d[0] == 4) {                // v4: + точка поворота и боковые съезды
       navType = d[1];
       navDist = d[2] | (d[3] << 8);
       navSpd  = d[4];
       navProg = d[5];
+      uint8_t k = d[6]; if (k > 16) k = 16;
+      if (n >= (size_t)(7 + k * 2)) {
+        for (uint8_t i = 0; i < k; i++) {
+          navPX[i] = (int8_t)d[7 + i * 2];
+          navPY[i] = (int8_t)d[8 + i * 2];
+        }
+        navN = k;
+        int o = 7 + k * 2;
+        if (n >= (size_t)(o + 3)) {
+          navMX = (int8_t)d[o]; navMY = (int8_t)d[o + 1];
+          uint8_t sc = d[o + 2]; if (sc > 6) sc = 6;
+          if (n >= (size_t)(o + 3 + sc * 2)) {
+            for (uint8_t i = 0; i < sc; i++) {
+              navSX[i] = (int8_t)d[o + 3 + i * 2];
+              navSY[i] = (int8_t)d[o + 4 + i * 2];
+            }
+            navStubN = sc;
+          } else navStubN = 0;
+        }
+      }
+      navAt = millis(); navFresh = true; lastActivity = millis();
+    } else if (n >= 7 && d[0] == 3) {          // v3: + прогресс маршрута
+      navType = d[1];
+      navDist = d[2] | (d[3] << 8);
+      navSpd  = d[4];
+      navProg = d[5];
+      navStubN = 0; navMX = -128;
       uint8_t k = d[6]; if (k > 16) k = 16;
       if (n >= (size_t)(7 + k * 2)) {
         for (uint8_t i = 0; i < k; i++) {
@@ -146,7 +176,7 @@ class NavCB : public BLECharacteristicCallbacks {
       navType = d[1];
       navDist = d[2] | (d[3] << 8);
       navSpd  = d[4];
-      navProg = 255;
+      navProg = 255; navStubN = 0; navMX = -128;
       uint8_t k = d[5]; if (k > 16) k = 16;
       if (n >= (size_t)(6 + k * 2)) {
         for (uint8_t i = 0; i < k; i++) {
@@ -160,7 +190,7 @@ class NavCB : public BLECharacteristicCallbacks {
       navType = d[1];
       navDist = d[2] | (d[3] << 8);
       navSpd  = d[4];
-      navN = 0; navProg = 255;
+      navN = 0; navProg = 255; navStubN = 0; navMX = -128;
       navAt = millis(); navFresh = true; lastActivity = millis();
     }
   }
@@ -271,8 +301,8 @@ void stampPath(const float *xs, const float *ys, int n, float r0, float r1, uint
     int i0 = i > 0 ? i - 1 : 0, i3 = i + 2 < n ? i + 2 : n - 1;
     float p0x = xs[i0], p0y = ys[i0], p1x = xs[i], p1y = ys[i];
     float p2x = xs[i + 1], p2y = ys[i + 1], p3x = xs[i3], p3y = ys[i3];
-    int st = (int)(hypotf(p2x - p1x, p2y - p1y) / 1.5f);
-    if (st < 2) st = 2;
+    int st = (int)(hypotf(p2x - p1x, p2y - p1y) / 0.8f);  // плотнее выборка = глаже линия
+    if (st < 3) st = 3;
     for (int k = 0; k <= st; k++) {
       float t = (float)k / st, t2 = t * t, t3 = t2 * t;
       float x = 0.5f * (2*p1x + (-p0x + p2x)*t + (2*p0x - 5*p1x + 4*p2x - p3x)*t2 + (-p0x + 3*p1x - 3*p2x + p3x)*t3);
@@ -281,6 +311,18 @@ void stampPath(const float *xs, const float *ys, int n, float r0, float r1, uint
       gfx->fillCircle((int16_t)x, (int16_t)y, (int16_t)(r0 + (r1 - r0) * u), c);
     }
   }
+}
+
+// боковые съезды у поворота: короткие тусклые стубы от точки манёвра (#5)
+void drawStubs() {
+  if (navMX == -128 || navStubN == 0) return;
+  float mx = 120 + navMX, my = 182 - navMY;
+  for (uint8_t i = 0; i < navStubN; i++) {
+    float ex = mx + navSX[i], ey = my - navSY[i];
+    segLine(mx, my, ex, ey, 3, C_AMB2);
+    gfx->fillCircle((int16_t)ex, (int16_t)ey, 2, C_AMB2);
+  }
+  gfx->fillCircle((int16_t)mx, (int16_t)my, 3, C_AMBER);  // узел перекрёстка
 }
 
 // разметка-пунктир по центру дороги (тёмные штрихи поверх сердцевины)
@@ -323,6 +365,7 @@ void drawRoad() {
     xs[n] = ax + navPX[i]; ys[n] = ay - navPY[i]; n++;
   }
   if (n < 2) { drawChevron2(120, 196, 1.0f); return; }
+  drawStubs();                                       // боковые съезды — под дорогой
   stampPath(xs, ys, n, 12, 7,    C_AMB3);            // ореол/глубина
   stampPath(xs, ys, n, 9,  5,    C_AMB2);            // кромка
   stampPath(xs, ys, n, 7,  3.2f, C_AMBER);          // сердцевина
